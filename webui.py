@@ -883,7 +883,7 @@ def normalize_network_clip_range(start_time, end_time):
         end_seconds = start_seconds + 60.0
     return start_seconds, end_seconds, requested_end
 
-def process_network_voice_media(url, start_time, end_time, use_proxy, proxy, cookies_file, progress=gr.Progress()):
+def process_network_voice_media(url, start_time, end_time, progress=gr.Progress()):
     url = (url or "").strip()
     if not url:
         gr.Warning(i18n("请先输入网络素材链接"))
@@ -902,6 +902,11 @@ def process_network_voice_media(url, start_time, end_time, use_proxy, proxy, coo
     except ImportError:
         gr.Error(i18n("未安装 yt-dlp，请重新同步项目依赖"))
         return gr.update(), voice_status_html("error", "未安装 yt-dlp", "请重新同步项目依赖。")
+
+    network_config = load_network_source_config()
+    use_proxy = network_config["use_proxy"]
+    proxy = network_config["proxy"]
+    cookies_file = network_config["cookies_file"]
 
     with tempfile.TemporaryDirectory() as tmp_dir:
         ffmpeg_path = resolve_ffmpeg_path()
@@ -937,7 +942,6 @@ def process_network_voice_media(url, start_time, end_time, use_proxy, proxy, coo
                 return gr.update(), voice_status_html("error", "Cookie 文件不存在", f"找不到：{cookie_path}")
             ydl_opts["cookiefile"] = cookie_path
         try:
-            save_network_source_config(use_proxy, proxy, cookies_file)
             progress(0.2, desc="正在解析素材链接...")
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                 ydl.extract_info(url, download=True)
@@ -2682,7 +2686,7 @@ with gr.Blocks(
         show_progress="hidden",
     ).then(
         process_network_voice_media,
-        inputs=[network_voice_url, network_clip_start, network_clip_end, network_use_proxy, network_proxy, network_cookies_file],
+        inputs=[network_voice_url, network_clip_start, network_clip_end],
         outputs=[prompt_audio, network_voice_status],
         show_progress="full",
     ).then(
