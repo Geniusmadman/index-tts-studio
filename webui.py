@@ -739,6 +739,20 @@ def voice_status_html(kind, title, detail=""):
         f'</div>'
     )
 
+def reference_audio_loading_html(detail="正在生成参考音色预览，请保持页面打开。"):
+    return (
+        '<div class="reference-loader-card">'
+        '<div class="reference-loader-title">'
+        '<span class="reference-loader-dot"></span>'
+        '<strong>正在准备参考音色</strong>'
+        '</div>'
+        f'<p>{html.escape(detail)}</p>'
+        '<div class="reference-flow-lines" aria-hidden="true">'
+        '<i></i><i></i><i></i><i></i><i></i><i></i>'
+        '</div>'
+        '</div>'
+    )
+
 def local_voice_upload_feedback(media_file):
     media_path = get_upload_path(media_file)
     if not media_path:
@@ -751,16 +765,33 @@ def local_voice_upload_feedback(media_file):
 
 def mark_local_processing(media_file):
     if not media_file:
-        return gr.update(interactive=True), voice_status_html("warn", "还没有上传素材", "请先选择本地音频或视频文件。")
+        return (
+            gr.update(interactive=True),
+            voice_status_html("warn", "还没有上传素材", "请先选择本地音频或视频文件。"),
+            gr.update(value="", visible=False),
+        )
     media_path = get_upload_path(media_file)
     if media_path and os.path.exists(media_path) and is_file_too_large(media_path):
-        return gr.update(interactive=True), voice_status_html("error", "文件超过大小限制", f"单个文件最大 {MAX_UPLOAD_SIZE_MB} MB，请先压缩或截取素材。")
-    return gr.update(interactive=False), voice_status_html("busy", "正在处理本地素材", "正在抽取音轨并转换为 24kHz 单声道 WAV，请保持页面打开。")
+        return (
+            gr.update(interactive=True),
+            voice_status_html("error", "文件超过大小限制", f"单个文件最大 {MAX_UPLOAD_SIZE_MB} MB，请先压缩或截取素材。"),
+            gr.update(value="", visible=False),
+        )
+    detail = "正在抽取音轨并转换为 24kHz 单声道 WAV，请保持页面打开。"
+    return (
+        gr.update(interactive=False),
+        voice_status_html("busy", "正在处理本地素材", detail),
+        gr.update(value=reference_audio_loading_html(detail), visible=True),
+    )
 
 def mark_network_processing(url, start_time, end_time):
     url = (url or "").strip()
     if not url:
-        return gr.update(interactive=True), voice_status_html("warn", "还没有填写链接", "请先粘贴 B站、抖音、小红书等素材链接。")
+        return (
+            gr.update(interactive=True),
+            voice_status_html("warn", "还没有填写链接", "请先粘贴 B站、抖音、小红书等素材链接。"),
+            gr.update(value="", visible=False),
+        )
     try:
         start_seconds, end_seconds, requested_end = normalize_network_clip_range(start_time, end_time)
         detail = f"准备解析并截取 {format_clip_time(start_seconds)} - {format_clip_time(end_seconds)}。"
@@ -768,16 +799,25 @@ def mark_network_processing(url, start_time, end_time):
             detail += " 你设置的跨度超过 60 秒，系统会自动限制为 60 秒。"
     except ValueError:
         detail = "正在校验时间格式。若格式错误，下一步会给出提示。"
-    return gr.update(interactive=False), voice_status_html("busy", "正在解析网络素材", detail)
+    return (
+        gr.update(interactive=False),
+        voice_status_html("busy", "正在解析网络素材", detail),
+        gr.update(value=reference_audio_loading_html(detail), visible=True),
+    )
 
 def restore_processing_button():
     return gr.update(interactive=True)
+
+def hide_reference_audio_loading():
+    time.sleep(0.8)
+    return gr.update(value="", visible=False)
 
 def cancel_local_voice_task():
     return (
         gr.update(value=None),
         gr.update(interactive=True),
         voice_status_html("warn", "已取消上传或处理", f"已清空本地素材选择。单个文件最大 {MAX_UPLOAD_SIZE_MB} MB。"),
+        gr.update(value="", visible=False),
     )
 
 def convert_media_to_prompt_audio(media_path, prefix):
@@ -1527,6 +1567,73 @@ textarea:focus, input:focus {
     animation: statusPulse 0.9s ease-in-out infinite;
 }
 
+.reference-loader-card {
+    position: relative;
+    overflow: hidden;
+    margin: 10px 0 12px;
+    padding: 14px 14px 16px;
+    border: 1px solid rgba(45, 212, 191, 0.38);
+    border-radius: 12px;
+    background:
+        radial-gradient(circle at 14% 0%, rgba(163, 255, 18, 0.16), transparent 32%),
+        radial-gradient(circle at 88% 12%, rgba(139, 92, 246, 0.18), transparent 34%),
+        rgba(11, 11, 25, 0.92);
+    color: #f8fafc;
+    box-shadow: inset 0 1px 0 rgba(255,255,255,0.09), 0 16px 34px rgba(0,0,0,0.24);
+}
+
+.reference-loader-title {
+    display: flex;
+    align-items: center;
+    gap: 9px;
+    font-size: 13px;
+    line-height: 1.35;
+}
+
+.reference-loader-title strong {
+    color: #ffffff;
+}
+
+.reference-loader-dot {
+    width: 10px;
+    height: 10px;
+    border-radius: 999px;
+    background: #a3ff12;
+    box-shadow: 0 0 16px rgba(163, 255, 18, 0.62);
+    animation: statusPulse 0.9s ease-in-out infinite;
+}
+
+.reference-loader-card p {
+    margin: 7px 0 12px;
+    color: #d7def7;
+    font-size: 12px;
+    line-height: 1.55;
+}
+
+.reference-flow-lines {
+    display: grid;
+    grid-template-columns: repeat(6, 1fr);
+    gap: 5px;
+    height: 34px;
+    align-items: stretch;
+}
+
+.reference-flow-lines i {
+    display: block;
+    border-radius: 999px;
+    background: linear-gradient(180deg, #a3ff12, #2dd4bf 38%, #8b5cf6 68%, #ff5c35);
+    background-size: 100% 220%;
+    opacity: 0.72;
+    transform-origin: center bottom;
+    animation: referenceLineFlow 1.05s ease-in-out infinite;
+}
+
+.reference-flow-lines i:nth-child(2) { animation-delay: -0.14s; }
+.reference-flow-lines i:nth-child(3) { animation-delay: -0.28s; }
+.reference-flow-lines i:nth-child(4) { animation-delay: -0.42s; }
+.reference-flow-lines i:nth-child(5) { animation-delay: -0.56s; }
+.reference-flow-lines i:nth-child(6) { animation-delay: -0.70s; }
+
 #process_local_media_button,
 #process_network_media_button,
 #cancel_local_media_button {
@@ -1657,6 +1764,24 @@ tr:nth-child(even) td, .wrap table tr:nth-child(even) td {
 @keyframes statusPulse {
     0%, 100% { transform: scale(0.82); opacity: 0.62; }
     50% { transform: scale(1.2); opacity: 1; }
+}
+
+@keyframes referenceLineFlow {
+    0%, 100% {
+        transform: scaleY(0.34);
+        background-position: 50% 0%;
+        opacity: 0.58;
+    }
+    45% {
+        transform: scaleY(1);
+        background-position: 50% 100%;
+        opacity: 1;
+    }
+    72% {
+        transform: scaleY(0.62);
+        background-position: 50% 55%;
+        opacity: 0.82;
+    }
 }
 
 @media (prefers-reduced-motion: reduce) {
@@ -2293,6 +2418,11 @@ with gr.Blocks(
                             load_voice_button = gr.Button(i18n("使用该音色"))
                             refresh_voices_button = gr.Button(i18n("刷新列表"))
                         library_voice_status = gr.Markdown("")
+                reference_audio_loading = gr.HTML(
+                    "",
+                    visible=False,
+                    elem_classes=["reference-loader-slot"],
+                )
                 prompt_audio = gr.Audio(
                     label=i18n("当前参考音色"),
                     key="prompt_audio",
@@ -2684,13 +2814,17 @@ with gr.Blocks(
     local_voice_process_event = process_local_media_button.click(
         mark_local_processing,
         inputs=[local_voice_media],
-        outputs=[process_local_media_button, local_voice_status],
+        outputs=[process_local_media_button, local_voice_status, reference_audio_loading],
         show_progress="hidden",
     ).then(
         process_local_voice_media,
         inputs=[local_voice_media],
         outputs=[prompt_audio, local_voice_status],
         show_progress="full",
+    ).then(
+        hide_reference_audio_loading,
+        outputs=[reference_audio_loading],
+        show_progress="hidden",
     ).then(
         restore_processing_button,
         outputs=[process_local_media_button],
@@ -2699,7 +2833,7 @@ with gr.Blocks(
 
     cancel_local_media_button.click(
         cancel_local_voice_task,
-        outputs=[local_voice_media, process_local_media_button, local_voice_status],
+        outputs=[local_voice_media, process_local_media_button, local_voice_status, reference_audio_loading],
         cancels=[local_voice_process_event],
         show_progress="hidden",
     )
@@ -2707,13 +2841,17 @@ with gr.Blocks(
     process_network_media_button.click(
         mark_network_processing,
         inputs=[network_voice_url, network_clip_start, network_clip_end],
-        outputs=[process_network_media_button, network_voice_status],
+        outputs=[process_network_media_button, network_voice_status, reference_audio_loading],
         show_progress="hidden",
     ).then(
         process_network_voice_media,
         inputs=[network_voice_url, network_clip_start, network_clip_end],
         outputs=[prompt_audio, network_voice_status],
         show_progress="full",
+    ).then(
+        hide_reference_audio_loading,
+        outputs=[reference_audio_loading],
+        show_progress="hidden",
     ).then(
         restore_processing_button,
         outputs=[process_network_media_button],
