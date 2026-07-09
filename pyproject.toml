@@ -56,6 +56,7 @@ dependencies = [
   "torchaudio==2.8.*",
   "tqdm>=4.67.1",
   "transformers==4.52.1",
+  "yt-dlp>=2025.6.30",
 
   # Use "wetext" on Windows/Mac, otherwise "WeTextProcessing" on Linux.
   "wetext>=0.0.9; sys_platform != 'linux'",
@@ -73,8 +74,9 @@ deepspeed = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/index-tts/index-tts"
-Repository = "https://github.com/index-tts/index-tts.git"
+Homepage = "https://github.com/Geniusmadman/index-tts-studio"
+Repository = "https://github.com/Geniusmadman/index-tts-studio.git"
+Upstream = "https://github.com/index-tts/index-tts"
 
 [project.scripts]
 # Set the installed binary names and entry points.

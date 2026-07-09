@@ -28,4 +28,14 @@ desktop.ini
 /cache/
 /checkpoints/*
 !/checkpoints/*.yaml
+/checkpoints/glossary.yaml
 /outputs/
+/logs/
+/prompts/
+/scripts/start_webui_remote.zsh
+
+# Local credentials and machine-specific service files.
+.env
+.env.*
+*.pem
+*.key
