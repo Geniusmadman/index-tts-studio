@@ -81,6 +81,8 @@ os.makedirs("prompts",exist_ok=True)
 SAVED_VOICES_DIR = os.path.join("prompts", "saved_voices")
 os.makedirs(SAVED_VOICES_DIR, exist_ok=True)
 SMART_LLM_CONFIG_PATH = os.path.join("prompts", "smart_llm_config.json")
+MAX_UPLOAD_SIZE_MB = int(os.getenv("INDEXTTS_MAX_UPLOAD_MB", "1024"))
+MAX_UPLOAD_SIZE_BYTES = MAX_UPLOAD_SIZE_MB * 1024 * 1024
 FFMPEG_CANDIDATES = [
     "ffmpeg",
     "/opt/homebrew/bin/ffmpeg",
@@ -640,6 +642,71 @@ def get_upload_path(file_value):
         return file_value.get("name") or file_value.get("path")
     return file_value
 
+def format_file_size(path):
+    try:
+        size = os.path.getsize(path)
+    except OSError:
+        return "未知大小"
+    if size < 1024 * 1024:
+        return f"{size / 1024:.1f} KB"
+    return f"{size / (1024 * 1024):.1f} MB"
+
+def is_file_too_large(path):
+    try:
+        return os.path.getsize(path) > MAX_UPLOAD_SIZE_BYTES
+    except OSError:
+        return False
+
+def voice_status_html(kind, title, detail=""):
+    detail_html = f"<p>{html.escape(detail)}</p>" if detail else ""
+    return (
+        f'<div class="voice-status-card is-{kind}">'
+        f'<span class="voice-status-dot"></span>'
+        f'<div><strong>{html.escape(title)}</strong>{detail_html}</div>'
+        f'</div>'
+    )
+
+def local_voice_upload_feedback(media_file):
+    media_path = get_upload_path(media_file)
+    if not media_path:
+        return gr.update(), voice_status_html("idle", "等待上传", f"请选择一段本地音频或视频。单个文件最大 {MAX_UPLOAD_SIZE_MB} MB。")
+    filename = os.path.basename(media_path)
+    size_label = format_file_size(media_path) if os.path.exists(media_path) else "等待服务端接收"
+    if os.path.exists(media_path) and is_file_too_large(media_path):
+        return gr.update(value=None), voice_status_html("error", "文件超过大小限制", f"{filename} · {size_label}。单个文件最大 {MAX_UPLOAD_SIZE_MB} MB。")
+    return gr.update(), voice_status_html("ready", "上传已完成", f"{filename} · {size_label}。点击“处理并用作音色”开始抽取音轨。")
+
+def mark_local_processing(media_file):
+    if not media_file:
+        return gr.update(interactive=True), voice_status_html("warn", "还没有上传素材", "请先选择本地音频或视频文件。")
+    media_path = get_upload_path(media_file)
+    if media_path and os.path.exists(media_path) and is_file_too_large(media_path):
+        return gr.update(interactive=True), voice_status_html("error", "文件超过大小限制", f"单个文件最大 {MAX_UPLOAD_SIZE_MB} MB，请先压缩或截取素材。")
+    return gr.update(interactive=False), voice_status_html("busy", "正在处理本地素材", "正在抽取音轨并转换为 24kHz 单声道 WAV，请保持页面打开。")
+
+def mark_network_processing(url, start_time, end_time):
+    url = (url or "").strip()
+    if not url:
+        return gr.update(interactive=True), voice_status_html("warn", "还没有填写链接", "请先粘贴 B站、抖音、小红书等素材链接。")
+    try:
+        start_seconds, end_seconds, requested_end = normalize_network_clip_range(start_time, end_time)
+        detail = f"准备解析并截取 {format_clip_time(start_seconds)} - {format_clip_time(end_seconds)}。"
+        if requested_end != end_seconds:
+            detail += " 你设置的跨度超过 60 秒，系统会自动限制为 60 秒。"
+    except ValueError:
+        detail = "正在校验时间格式。若格式错误，下一步会给出提示。"
+    return gr.update(interactive=False), voice_status_html("busy", "正在解析网络素材", detail)
+
+def restore_processing_button():
+    return gr.update(interactive=True)
+
+def cancel_local_voice_task():
+    return (
+        gr.update(value=None),
+        gr.update(interactive=True),
+        voice_status_html("warn", "已取消上传或处理", f"已清空本地素材选择。单个文件最大 {MAX_UPLOAD_SIZE_MB} MB。"),
+    )
+
 def convert_media_to_prompt_audio(media_path, prefix):
     if not media_path or not os.path.exists(media_path):
         raise FileNotFoundError(media_path or "")
@@ -661,29 +728,35 @@ def convert_media_to_prompt_audio(media_path, prefix):
     subprocess.run(command, check=True, capture_output=True, text=True)
     return output_path
 
-def process_local_voice_media(media_file):
+def process_local_voice_media(media_file, progress=gr.Progress()):
     if not media_file:
         gr.Warning(i18n("请先上传本地音频或视频"))
-        return gr.update(), "请先上传本地音频或视频。"
+        return gr.update(), voice_status_html("warn", "请先上传本地音频或视频")
 
     media_path = get_upload_path(media_file)
     if not media_path or not os.path.exists(media_path):
         gr.Error(i18n("找不到上传的媒体文件"))
-        return gr.update(), "找不到上传的媒体文件。"
+        return gr.update(), voice_status_html("error", "找不到上传的媒体文件", "请重新选择文件后再处理。")
+    if is_file_too_large(media_path):
+        return gr.update(), voice_status_html("error", "文件超过大小限制", f"单个文件最大 {MAX_UPLOAD_SIZE_MB} MB。")
 
     try:
+        progress(0.15, desc="正在读取上传文件...")
+        progress(0.45, desc="正在抽取音轨并转换格式...")
         output_path = convert_media_to_prompt_audio(media_path, "local_ref")
+        progress(0.9, desc="正在设置参考音色...")
     except FileNotFoundError:
         gr.Error(i18n("未找到 ffmpeg，请先安装 ffmpeg"))
-        return gr.update(), "未找到 ffmpeg，请先安装 ffmpeg。"
+        return gr.update(), voice_status_html("error", "未找到 ffmpeg", "请先安装 ffmpeg 后再处理音视频。")
     except subprocess.CalledProcessError as exc:
         error_message = (exc.stderr or exc.stdout or "").strip()
         print(f"Failed to process local media: {error_message}")
         gr.Error(i18n("音视频处理失败，请确认文件包含可读取的音轨"))
-        return gr.update(), "音视频处理失败，请确认文件包含可读取的音轨。"
+        return gr.update(), voice_status_html("error", "音视频处理失败", "请确认文件包含可读取的音轨，或先剪成较短的音频再上传。")
 
     gr.Info(i18n("已设为参考音色"), duration=2)
-    return gr.update(value=output_path), f"当前参考音色：`{output_path}`"
+    progress(1.0, desc="完成")
+    return gr.update(value=output_path), voice_status_html("success", "已设为参考音色", f"当前参考音色：{output_path}")
 
 def find_downloaded_media_file(download_dir):
     candidates = []
@@ -735,24 +808,25 @@ def normalize_network_clip_range(start_time, end_time):
         end_seconds = start_seconds + 60.0
     return start_seconds, end_seconds, requested_end
 
-def process_network_voice_media(url, start_time, end_time):
+def process_network_voice_media(url, start_time, end_time, progress=gr.Progress()):
     url = (url or "").strip()
     if not url:
         gr.Warning(i18n("请先输入网络素材链接"))
-        return gr.update(), "请先输入网络素材链接。"
+        return gr.update(), voice_status_html("warn", "请先输入网络素材链接")
 
     try:
         start_seconds, end_seconds, requested_end = normalize_network_clip_range(start_time, end_time)
     except ValueError:
         gr.Warning(i18n("请输入正确的起止时间"))
-        return gr.update(), "时间格式支持秒数、MM:SS、HH:MM:SS，且结束时间必须大于起始时间。"
+        return gr.update(), voice_status_html("warn", "时间格式不正确", "支持秒数、MM:SS、HH:MM:SS，且结束时间必须大于起始时间。")
 
     try:
+        progress(0.08, desc="正在加载 yt-dlp...")
         import yt_dlp
         from yt_dlp.utils import download_range_func
     except ImportError:
         gr.Error(i18n("未安装 yt-dlp，请重新同步项目依赖"))
-        return gr.update(), "未安装 yt-dlp。"
+        return gr.update(), voice_status_html("error", "未安装 yt-dlp", "请重新同步项目依赖。")
 
     with tempfile.TemporaryDirectory() as tmp_dir:
         ydl_opts = {
@@ -765,25 +839,30 @@ def process_network_voice_media(url, start_time, end_time):
             "force_keyframes_at_cuts": True,
         }
         try:
+            progress(0.2, desc="正在解析素材链接...")
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                 ydl.extract_info(url, download=True)
+            progress(0.72, desc="正在定位下载片段...")
             media_path = find_downloaded_media_file(tmp_dir)
             if not media_path:
                 raise RuntimeError("no downloaded media file")
+            progress(0.82, desc="正在抽取音频...")
             output_path = convert_media_to_prompt_audio(media_path, "network_ref")
+            progress(0.95, desc="正在设置参考音色...")
         except FileNotFoundError:
             gr.Error(i18n("未找到 ffmpeg，请先安装 ffmpeg"))
-            return gr.update(), "未找到 ffmpeg，请先安装 ffmpeg。"
+            return gr.update(), voice_status_html("error", "未找到 ffmpeg", "请先安装 ffmpeg 后再处理网络素材。")
         except Exception as exc:
             print(f"Failed to process network media: {exc}")
             gr.Error(i18n("网络素材处理失败，请确认链接可访问"))
-            return gr.update(), "网络素材处理失败。B站、抖音、小红书链接可能受登录、反爬或权限影响。"
+            return gr.update(), voice_status_html("error", "网络素材处理失败", "B站、抖音、小红书链接可能受登录、反爬或权限影响。")
 
     gr.Info(i18n("已处理网络素材，并设为参考音色"), duration=2)
     clip_note = f"已截取 {format_clip_time(start_seconds)} - {format_clip_time(end_seconds)}。"
     if requested_end != end_seconds:
         clip_note += " 你设置的跨度超过 60 秒，已自动限制为 60 秒。"
-    return gr.update(value=output_path), f"{clip_note}\n\n当前参考音色：`{output_path}`"
+    progress(1.0, desc="完成")
+    return gr.update(value=output_path), voice_status_html("success", "已设为参考音色", f"{clip_note} 当前参考音色：{output_path}")
 
 def create_warning_message(warning_text):
     return gr.HTML(f"<div style=\"padding: 0.5em 0.8em; border-radius: 0.5em; background: #ffa87d; color: #000; font-weight: bold\">{html.escape(warning_text)}</div>")
@@ -1263,8 +1342,65 @@ textarea:focus, input:focus {
     background: rgba(45, 212, 191, 0.18) !important;
 }
 
+.voice-status-card {
+    display: grid;
+    grid-template-columns: 14px 1fr;
+    gap: 10px;
+    align-items: start;
+    margin: 10px 0 4px;
+    padding: 11px 12px;
+    border: 1px solid rgba(45, 212, 191, 0.22);
+    border-radius: 10px;
+    background: rgba(255,255,255,0.055);
+    color: #f8fafc;
+    box-shadow: inset 0 1px 0 rgba(255,255,255,0.08);
+}
+
+.voice-status-card strong {
+    display: block;
+    color: #ffffff;
+    font-size: 13px;
+    line-height: 1.35;
+}
+
+.voice-status-card p {
+    margin: 3px 0 0;
+    color: #d7def7;
+    font-size: 12px;
+    line-height: 1.55;
+}
+
+.voice-status-dot {
+    width: 10px;
+    height: 10px;
+    margin-top: 4px;
+    border-radius: 999px;
+    background: var(--tts-primary);
+    box-shadow: 0 0 16px rgba(45, 212, 191, 0.58);
+}
+
+.voice-status-card.is-idle .voice-status-dot { background: var(--tts-faint); box-shadow: none; }
+.voice-status-card.is-ready .voice-status-dot { background: var(--tts-lime); box-shadow: 0 0 16px rgba(163, 255, 18, 0.5); }
+.voice-status-card.is-success .voice-status-dot { background: var(--tts-primary); }
+.voice-status-card.is-warn .voice-status-dot { background: #fbbf24; box-shadow: 0 0 16px rgba(251, 191, 36, 0.5); }
+.voice-status-card.is-error .voice-status-dot { background: #fb7185; box-shadow: 0 0 16px rgba(251, 113, 133, 0.55); }
+
+.voice-status-card.is-busy {
+    border-color: rgba(45, 212, 191, 0.48);
+    background:
+        linear-gradient(90deg, rgba(45,212,191,0.12), rgba(139,92,246,0.10), rgba(45,212,191,0.12)),
+        rgba(255,255,255,0.055);
+    background-size: 220% 100%;
+    animation: statusFlow 1.4s linear infinite;
+}
+
+.voice-status-card.is-busy .voice-status-dot {
+    animation: statusPulse 0.9s ease-in-out infinite;
+}
+
 #process_local_media_button,
-#process_network_media_button {
+#process_network_media_button,
+#cancel_local_media_button {
     background: var(--tts-primary) !important;
     border: 1px solid var(--tts-primary) !important;
     color: white !important;
@@ -1274,9 +1410,30 @@ textarea:focus, input:focus {
 }
 
 #process_local_media_button:hover,
-#process_network_media_button:hover {
+#process_network_media_button:hover,
+#cancel_local_media_button:hover {
     background: var(--tts-primary-dark) !important;
     border-color: var(--tts-primary-dark) !important;
+}
+
+#process_local_media_button:disabled,
+#process_network_media_button:disabled {
+    opacity: 0.68 !important;
+    cursor: wait !important;
+    filter: saturate(0.8) !important;
+}
+
+#cancel_local_media_button {
+    background: rgba(251, 113, 133, 0.12) !important;
+    border-color: rgba(251, 113, 133, 0.48) !important;
+    color: #ffe4e8 !important;
+    min-height: 38px !important;
+    box-shadow: inset 0 1px 0 rgba(255,255,255,0.08), 0 10px 20px rgba(0,0,0,0.14) !important;
+}
+
+#cancel_local_media_button:hover {
+    background: rgba(251, 113, 133, 0.2) !important;
+    border-color: rgba(251, 113, 133, 0.72) !important;
 }
 
 button {
@@ -1288,7 +1445,7 @@ button.primary, button.secondary, .button {
     font-weight: 700 !important;
 }
 
-button:not(#gen_button):not(#smart_gen_button):not(#process_local_media_button):not(#process_network_media_button) {
+button:not(#gen_button):not(#smart_gen_button):not(#process_local_media_button):not(#process_network_media_button):not(#cancel_local_media_button) {
     background: rgba(255,255,255,0.055) !important;
     color: #f8fafc !important;
     border: 1px solid rgba(45, 212, 191, 0.22) !important;
@@ -1296,7 +1453,7 @@ button:not(#gen_button):not(#smart_gen_button):not(#process_local_media_button):
     transition: border-color 180ms ease, background 180ms ease, transform 180ms ease !important;
 }
 
-button:not(#gen_button):not(#smart_gen_button):not(#process_local_media_button):not(#process_network_media_button):hover {
+button:not(#gen_button):not(#smart_gen_button):not(#process_local_media_button):not(#process_network_media_button):not(#cancel_local_media_button):hover {
     background: rgba(45, 212, 191, 0.12) !important;
     border-color: rgba(45, 212, 191, 0.46) !important;
     transform: translateY(-1px);
@@ -1361,6 +1518,16 @@ tr:nth-child(even) td, .wrap table tr:nth-child(even) td {
 @keyframes scanline {
     0%, 100% { opacity: 0.38; transform: scaleX(0.72); }
     50% { opacity: 1; transform: scaleX(1); }
+}
+
+@keyframes statusFlow {
+    from { background-position: 0% 50%; }
+    to { background-position: 220% 50%; }
+}
+
+@keyframes statusPulse {
+    0%, 100% { transform: scale(0.82); opacity: 0.62; }
+    50% { transform: scale(1.2); opacity: 1; }
 }
 
 @media (prefers-reduced-motion: reduce) {
@@ -1498,6 +1665,36 @@ textarea::placeholder,
 input::placeholder {
     color: #b8c4e6 !important;
     opacity: 1 !important;
+}
+
+.toast-wrap,
+.toast,
+[data-testid="toast"],
+[class*="toast"],
+[class*="notification"],
+[class*="Toast"] {
+    color-scheme: dark !important;
+}
+
+.toast,
+[data-testid="toast"],
+[class*="toast"] > div,
+[class*="notification"] > div,
+[class*="Toast"] > div {
+    background: linear-gradient(135deg, rgba(9, 9, 20, 0.98), rgba(18, 26, 43, 0.98)) !important;
+    color: #f8fafc !important;
+    -webkit-text-fill-color: #f8fafc !important;
+    border: 1px solid rgba(45, 212, 191, 0.42) !important;
+    box-shadow: 0 18px 44px rgba(0, 0, 0, 0.48), 0 0 24px rgba(45, 212, 191, 0.14) !important;
+}
+
+.toast *,
+[data-testid="toast"] *,
+[class*="toast"] *,
+[class*="notification"] *,
+[class*="Toast"] * {
+    color: #f8fafc !important;
+    -webkit-text-fill-color: #f8fafc !important;
 }
 """
 
@@ -1683,7 +1880,163 @@ html body .gradio-container .info {
       margin:0 0 8px !important; padding:0 !important; border:0 !important; background:transparent !important;
       color:#d7def7 !important; -webkit-text-fill-color:#d7def7 !important; text-shadow:none !important;
     }
+    .toast-wrap,
+    .toast,
+    [data-testid="toast"],
+    [class*="toast"],
+    [class*="notification"],
+    [class*="Toast"] {
+      color-scheme:dark !important;
+    }
+    .toast,
+    [data-testid="toast"],
+    [class*="toast"] > div,
+    [class*="notification"] > div,
+    [class*="Toast"] > div {
+      background:linear-gradient(135deg, rgba(9,9,20,.98), rgba(18,26,43,.98)) !important;
+      color:#f8fafc !important;
+      -webkit-text-fill-color:#f8fafc !important;
+      border:1px solid rgba(45,212,191,.42) !important;
+      box-shadow:0 18px 44px rgba(0,0,0,.48), 0 0 24px rgba(45,212,191,.14) !important;
+    }
+    .toast *,
+    [data-testid="toast"] *,
+    [class*="toast"] *,
+    [class*="notification"] *,
+    [class*="Toast"] * {
+      color:#f8fafc !important;
+      -webkit-text-fill-color:#f8fafc !important;
+    }
   `;
+  const maxUploadSizeMb = 1024;
+  const maxUploadSizeBytes = maxUploadSizeMb * 1024 * 1024;
+  const activeUploadControllers = new Set();
+  const activeUploadXhrs = new Set();
+  function showUploadLimitToast(file) {
+    const existing = document.querySelector(".indextts-upload-limit-toast");
+    if (existing) existing.remove();
+    const toast = document.createElement("div");
+    toast.className = "indextts-upload-limit-toast";
+    toast.setAttribute("role", "alert");
+    toast.innerHTML = `<strong>文件超过大小限制</strong><p>${file.name} 超过 ${maxUploadSizeMb} MB，请压缩或截取后再上传。</p>`;
+    Object.assign(toast.style, {
+      position: "fixed",
+      top: "18px",
+      right: "18px",
+      zIndex: "999999",
+      maxWidth: "360px",
+      padding: "12px 14px",
+      borderRadius: "12px",
+      border: "1px solid rgba(45,212,191,.52)",
+      background: "linear-gradient(135deg, rgba(9,9,20,.98), rgba(18,26,43,.98))",
+      color: "#f8fafc",
+      boxShadow: "0 18px 44px rgba(0,0,0,.5), 0 0 24px rgba(45,212,191,.16)",
+      fontFamily: "Poppins, -apple-system, BlinkMacSystemFont, sans-serif",
+      lineHeight: "1.45"
+    });
+    toast.querySelector("strong").style.cssText = "display:block;color:#fff;font-size:13px;margin-bottom:4px;";
+    toast.querySelector("p").style.cssText = "margin:0;color:#d7def7;font-size:12px;";
+    document.body.appendChild(toast);
+    setTimeout(() => toast.remove(), 5200);
+  }
+  function isLocalVoiceInput(input) {
+    const accept = (input.getAttribute("accept") || "").toLowerCase();
+    return accept.includes(".mp4") || accept.includes(".mov") || accept.includes(".mkv") || accept.includes(".webm");
+  }
+  function showUploadCancelToast() {
+    const file = { name: "当前上传任务" };
+    const existing = document.querySelector(".indextts-upload-limit-toast");
+    if (existing) existing.remove();
+    const toast = document.createElement("div");
+    toast.className = "indextts-upload-limit-toast";
+    toast.setAttribute("role", "alert");
+    toast.innerHTML = `<strong>已取消上传/处理</strong><p>已尝试中断正在上传的文件，并清空本地素材选择。</p>`;
+    Object.assign(toast.style, {
+      position: "fixed",
+      top: "18px",
+      right: "18px",
+      zIndex: "999999",
+      maxWidth: "360px",
+      padding: "12px 14px",
+      borderRadius: "12px",
+      border: "1px solid rgba(251,113,133,.52)",
+      background: "linear-gradient(135deg, rgba(9,9,20,.98), rgba(43,18,28,.98))",
+      color: "#f8fafc",
+      boxShadow: "0 18px 44px rgba(0,0,0,.5), 0 0 24px rgba(251,113,133,.16)",
+      fontFamily: "Poppins, -apple-system, BlinkMacSystemFont, sans-serif",
+      lineHeight: "1.45"
+    });
+    toast.querySelector("strong").style.cssText = "display:block;color:#fff;font-size:13px;margin-bottom:4px;";
+    toast.querySelector("p").style.cssText = "margin:0;color:#ffd9df;font-size:12px;";
+    document.body.appendChild(toast);
+    setTimeout(() => toast.remove(), 4200);
+  }
+  function installUploadGuard() {
+    document.querySelectorAll('input[type="file"]').forEach((input) => {
+      if (input.dataset.indexttsUploadGuard === "1" || !isLocalVoiceInput(input)) return;
+      input.dataset.indexttsUploadGuard = "1";
+      input.addEventListener("change", (event) => {
+        const files = Array.from(input.files || []);
+        const oversized = files.find((file) => file.size > maxUploadSizeBytes);
+        if (!oversized) return;
+        event.preventDefault();
+        event.stopPropagation();
+        input.value = "";
+        showUploadLimitToast(oversized);
+      }, true);
+    });
+  }
+  function clearLocalVoiceInputs() {
+    document.querySelectorAll('input[type="file"]').forEach((input) => {
+      if (!isLocalVoiceInput(input)) return;
+      input.value = "";
+      input.dispatchEvent(new Event("change", { bubbles: true }));
+    });
+  }
+  function abortActiveUploads() {
+    activeUploadControllers.forEach((controller) => controller.abort());
+    activeUploadControllers.clear();
+    activeUploadXhrs.forEach((xhr) => {
+      try { xhr.abort(); } catch (_) {}
+    });
+    activeUploadXhrs.clear();
+    clearLocalVoiceInputs();
+    showUploadCancelToast();
+  }
+  function installUploadAbortPatch() {
+    if (!window.__indexttsUploadAbortPatched) {
+      window.__indexttsUploadAbortPatched = true;
+      const originalFetch = window.fetch.bind(window);
+      window.fetch = (resource, init = {}) => {
+        const url = typeof resource === "string" ? resource : resource?.url || "";
+        if (String(url).includes("/gradio_api/upload")) {
+          const controller = new AbortController();
+          activeUploadControllers.add(controller);
+          const nextInit = { ...init, signal: init.signal || controller.signal };
+          return originalFetch(resource, nextInit).finally(() => activeUploadControllers.delete(controller));
+        }
+        return originalFetch(resource, init);
+      };
+      const originalOpen = XMLHttpRequest.prototype.open;
+      const originalSend = XMLHttpRequest.prototype.send;
+      XMLHttpRequest.prototype.open = function(method, url, ...rest) {
+        this.__indexttsUploadUrl = String(url || "");
+        return originalOpen.call(this, method, url, ...rest);
+      };
+      XMLHttpRequest.prototype.send = function(...args) {
+        if (this.__indexttsUploadUrl && this.__indexttsUploadUrl.includes("/gradio_api/upload")) {
+          activeUploadXhrs.add(this);
+          this.addEventListener("loadend", () => activeUploadXhrs.delete(this), { once: true });
+        }
+        return originalSend.apply(this, args);
+      };
+    }
+    document.querySelectorAll("#cancel_local_media_button").forEach((button) => {
+      if (button.dataset.indexttsCancelGuard === "1") return;
+      button.dataset.indexttsCancelGuard = "1";
+      button.addEventListener("click", abortActiveUploads, true);
+    });
+  }
   function installLock() {
     let style = document.getElementById(styleId);
     if (!style) {
@@ -1694,6 +2047,8 @@ html body .gradio-container .info {
       document.head.appendChild(style);
     }
     if (style.textContent !== css) style.textContent = css;
+    installUploadGuard();
+    installUploadAbortPatch();
   }
   installLock();
   window.addEventListener("load", installLock);
@@ -1755,7 +2110,11 @@ with gr.Blocks(
                             i18n("处理并用作音色"),
                             elem_id="process_local_media_button",
                         )
-                        local_voice_status = gr.Markdown("")
+                        cancel_local_media_button = gr.Button(
+                            i18n("取消上传/处理"),
+                            elem_id="cancel_local_media_button",
+                        )
+                        local_voice_status = gr.Markdown(voice_status_html("idle", "等待上传", f"请选择一段本地音频或视频。单个文件最大 {MAX_UPLOAD_SIZE_MB} MB。"))
                     with gr.Tab(i18n("网络素材")):
                         network_voice_url = gr.Textbox(
                             label=i18n("素材链接"),
@@ -1774,7 +2133,7 @@ with gr.Blocks(
                             i18n("解析并用作音色"),
                             elem_id="process_network_media_button",
                         )
-                        network_voice_status = gr.Markdown("")
+                        network_voice_status = gr.Markdown(voice_status_html("idle", "等待链接", "粘贴素材链接后，系统会默认截取前 60 秒。"))
                     with gr.Tab(i18n("常用音色库")):
                         saved_voice_dropdown = gr.Dropdown(
                             label=i18n("选择已保存音色"),
@@ -2167,16 +2526,49 @@ with gr.Blocks(
         outputs=[segments_preview]
     )
 
-    process_local_media_button.click(
+    local_voice_media.change(
+        local_voice_upload_feedback,
+        inputs=[local_voice_media],
+        outputs=[local_voice_media, local_voice_status],
+    )
+
+    local_voice_process_event = process_local_media_button.click(
+        mark_local_processing,
+        inputs=[local_voice_media],
+        outputs=[process_local_media_button, local_voice_status],
+        show_progress="hidden",
+    ).then(
         process_local_voice_media,
         inputs=[local_voice_media],
         outputs=[prompt_audio, local_voice_status],
+        show_progress="full",
+    ).then(
+        restore_processing_button,
+        outputs=[process_local_media_button],
+        show_progress="hidden",
+    )
+
+    cancel_local_media_button.click(
+        cancel_local_voice_task,
+        outputs=[local_voice_media, process_local_media_button, local_voice_status],
+        cancels=[local_voice_process_event],
+        show_progress="hidden",
     )
 
     process_network_media_button.click(
+        mark_network_processing,
+        inputs=[network_voice_url, network_clip_start, network_clip_end],
+        outputs=[process_network_media_button, network_voice_status],
+        show_progress="hidden",
+    ).then(
         process_network_voice_media,
         inputs=[network_voice_url, network_clip_start, network_clip_end],
         outputs=[prompt_audio, network_voice_status],
+        show_progress="full",
+    ).then(
+        restore_processing_button,
+        outputs=[process_network_media_button],
+        show_progress="hidden",
     )
 
     save_voice_button.click(
