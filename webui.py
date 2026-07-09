@@ -81,6 +81,7 @@ os.makedirs("prompts",exist_ok=True)
 SAVED_VOICES_DIR = os.path.join("prompts", "saved_voices")
 os.makedirs(SAVED_VOICES_DIR, exist_ok=True)
 SMART_LLM_CONFIG_PATH = os.path.join("prompts", "smart_llm_config.json")
+NETWORK_SOURCE_CONFIG_PATH = os.path.join("prompts", "network_source_config.json")
 MAX_UPLOAD_SIZE_MB = int(os.getenv("INDEXTTS_MAX_UPLOAD_MB", "1024"))
 MAX_UPLOAD_SIZE_BYTES = MAX_UPLOAD_SIZE_MB * 1024 * 1024
 FFMPEG_CANDIDATES = [
@@ -121,11 +122,13 @@ def load_smart_llm_config():
         print(f"Failed to load smart LLM config: {exc}")
     return config
 
-def save_smart_llm_config(analysis_mode, api_base, api_key, model, use_proxy, proxy, pause_ms):
+def save_smart_llm_config(analysis_mode, api_base, api_key, model, use_proxy, proxy, pause_ms, keep_existing_key=False):
+    saved_config = load_smart_llm_config() if keep_existing_key else {}
+    next_api_key = api_key if api_key else saved_config.get("api_key", "")
     config = {
         "analysis_mode": analysis_mode or "本地规则",
         "api_base": (api_base or "").strip() or "https://api.openai.com/v1/chat/completions",
-        "api_key": api_key or "",
+        "api_key": next_api_key or "",
         "model": (model or "").strip() or "gpt-4o-mini",
         "use_proxy": bool(use_proxy),
         "proxy": (proxy or "").strip(),
@@ -145,16 +148,67 @@ def load_smart_llm_config_for_ui():
     return (
         gr.update(value=config["analysis_mode"]),
         gr.update(value=config["api_base"]),
-        gr.update(value=config["api_key"]),
+        gr.update(value=""),
         gr.update(value=config["model"]),
         gr.update(value=config["use_proxy"]),
         gr.update(value=config["proxy"], interactive=bool(config["use_proxy"])),
         gr.update(value=config["pause_ms"]),
-        "已载入上次保存的大模型配置。",
+        "已载入上次保存的大模型配置。API Key 已保存在本机，页面不会回填显示。",
     )
 
 def on_smart_proxy_toggle(use_proxy, analysis_mode, api_base, api_key, model, proxy, pause_ms):
-    status = save_smart_llm_config(analysis_mode, api_base, api_key, model, use_proxy, proxy, pause_ms)
+    status = save_smart_llm_config(analysis_mode, api_base, api_key, model, use_proxy, proxy, pause_ms, keep_existing_key=True)
+    return gr.update(interactive=bool(use_proxy)), status
+
+def save_smart_llm_config_keep_key(analysis_mode, api_base, api_key, model, use_proxy, proxy, pause_ms):
+    return save_smart_llm_config(
+        analysis_mode,
+        api_base,
+        api_key,
+        model,
+        use_proxy,
+        proxy,
+        pause_ms,
+        keep_existing_key=True,
+    )
+
+def default_network_source_config():
+    return {
+        "use_proxy": False,
+        "proxy": os.getenv("NETWORK_SOURCE_PROXY", os.getenv("HTTPS_PROXY", os.getenv("HTTP_PROXY", ""))),
+        "cookies_file": os.getenv("NETWORK_SOURCE_COOKIES", ""),
+    }
+
+def load_network_source_config():
+    config = default_network_source_config()
+    if not os.path.exists(NETWORK_SOURCE_CONFIG_PATH):
+        return config
+    try:
+        with open(NETWORK_SOURCE_CONFIG_PATH, "r", encoding="utf-8") as f:
+            saved = json.load(f)
+        if isinstance(saved, dict):
+            config.update({key: value for key, value in saved.items() if key in config})
+    except Exception as exc:
+        print(f"Failed to load network source config: {exc}")
+    return config
+
+def save_network_source_config(use_proxy, proxy, cookies_file):
+    config = {
+        "use_proxy": bool(use_proxy),
+        "proxy": (proxy or "").strip(),
+        "cookies_file": (cookies_file or "").strip(),
+    }
+    try:
+        os.makedirs(os.path.dirname(NETWORK_SOURCE_CONFIG_PATH), exist_ok=True)
+        with open(NETWORK_SOURCE_CONFIG_PATH, "w", encoding="utf-8") as f:
+            json.dump(config, f, ensure_ascii=False, indent=2)
+        return "网络素材配置已保存。"
+    except Exception as exc:
+        print(f"Failed to save network source config: {exc}")
+        return "网络素材配置保存失败，请检查 prompts 目录权限。"
+
+def on_network_proxy_toggle(use_proxy, proxy, cookies_file):
+    status = save_network_source_config(use_proxy, proxy, cookies_file)
     return gr.update(interactive=bool(use_proxy)), status
 
 MAX_LENGTH_TO_USE_SPEED = 70
@@ -491,7 +545,9 @@ def merge_audio_files(audio_paths, output_path, pause_ms=180):
 def gen_smart_segments(prompt, text, analysis_mode, api_base, api_key, model, use_proxy, proxy,
                        pause_ms, max_text_tokens_per_segment=120,
                        *args, progress=gr.Progress()):
-    save_smart_llm_config(analysis_mode, api_base, api_key, model, use_proxy, proxy, pause_ms)
+    save_smart_llm_config(analysis_mode, api_base, api_key, model, use_proxy, proxy, pause_ms, keep_existing_key=True)
+    if not api_key:
+        api_key = load_smart_llm_config().get("api_key", "")
     if not prompt:
         gr.Warning(i18n("请先上传或选择参考音色"))
         return gr.update(), []
@@ -769,6 +825,25 @@ def find_downloaded_media_file(download_dir):
         return None
     return max(candidates, key=lambda path: os.path.getsize(path))
 
+def summarize_yt_dlp_error(exc):
+    message = str(exc).strip()
+    cause = getattr(exc, "__cause__", None)
+    if cause:
+        message = f"{message} {cause}".strip()
+    message = re.sub(r"\s+", " ", message)
+    if not message:
+        return "未返回具体错误。"
+    if len(message) > 260:
+        message = message[:260].rstrip() + "..."
+    lowered = message.lower()
+    if any(keyword in lowered for keyword in ["login", "cookie", "cookies", "sign in", "登录"]):
+        return f"{message}。可能需要登录 Cookie。"
+    if any(keyword in lowered for keyword in ["forbidden", "403", "captcha", "verify", "验证", "风控"]):
+        return f"{message}。可能被平台风控或需要验证码。"
+    if any(keyword in lowered for keyword in ["unsupported url", "no suitable extractor"]):
+        return f"{message}。当前 yt-dlp 可能不支持该链接格式。"
+    return message
+
 def parse_clip_time(value, default=None):
     if value is None:
         return default
@@ -808,7 +883,7 @@ def normalize_network_clip_range(start_time, end_time):
         end_seconds = start_seconds + 60.0
     return start_seconds, end_seconds, requested_end
 
-def process_network_voice_media(url, start_time, end_time, progress=gr.Progress()):
+def process_network_voice_media(url, start_time, end_time, use_proxy, proxy, cookies_file, progress=gr.Progress()):
     url = (url or "").strip()
     if not url:
         gr.Warning(i18n("请先输入网络素材链接"))
@@ -829,16 +904,40 @@ def process_network_voice_media(url, start_time, end_time, progress=gr.Progress(
         return gr.update(), voice_status_html("error", "未安装 yt-dlp", "请重新同步项目依赖。")
 
     with tempfile.TemporaryDirectory() as tmp_dir:
+        ffmpeg_path = resolve_ffmpeg_path()
+        if not ffmpeg_path:
+            gr.Error(i18n("未找到 ffmpeg，请先安装 ffmpeg"))
+            return gr.update(), voice_status_html("error", "未找到 ffmpeg", "请先安装 ffmpeg 后再处理网络素材。")
         ydl_opts = {
             "format": "bestaudio/best",
             "outtmpl": os.path.join(tmp_dir, "%(title).80s.%(ext)s"),
             "noplaylist": True,
             "quiet": True,
-            "no_warnings": True,
+            "no_warnings": False,
+            "retries": 3,
+            "fragment_retries": 3,
+            "socket_timeout": 30,
             "download_ranges": download_range_func(None, [(start_seconds, end_seconds)]),
             "force_keyframes_at_cuts": True,
+            "ffmpeg_location": os.path.dirname(ffmpeg_path),
+            "http_headers": {
+                "User-Agent": (
+                    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/126.0.0.0 Safari/537.36"
+                ),
+                "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+            },
         }
+        if use_proxy and proxy and proxy.strip():
+            ydl_opts["proxy"] = proxy.strip()
+        if cookies_file and cookies_file.strip():
+            cookie_path = os.path.expanduser(cookies_file.strip())
+            if not os.path.exists(cookie_path):
+                return gr.update(), voice_status_html("error", "Cookie 文件不存在", f"找不到：{cookie_path}")
+            ydl_opts["cookiefile"] = cookie_path
         try:
+            save_network_source_config(use_proxy, proxy, cookies_file)
             progress(0.2, desc="正在解析素材链接...")
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                 ydl.extract_info(url, download=True)
@@ -853,9 +952,10 @@ def process_network_voice_media(url, start_time, end_time, progress=gr.Progress(
             gr.Error(i18n("未找到 ffmpeg，请先安装 ffmpeg"))
             return gr.update(), voice_status_html("error", "未找到 ffmpeg", "请先安装 ffmpeg 后再处理网络素材。")
         except Exception as exc:
-            print(f"Failed to process network media: {exc}")
-            gr.Error(i18n("网络素材处理失败，请确认链接可访问"))
-            return gr.update(), voice_status_html("error", "网络素材处理失败", "B站、抖音、小红书链接可能受登录、反爬或权限影响。")
+            error_detail = summarize_yt_dlp_error(exc)
+            print(f"Failed to process network media: {error_detail}")
+            gr.Error(i18n("网络素材处理失败，请查看页面错误详情"))
+            return gr.update(), voice_status_html("error", "网络素材处理失败", error_detail)
 
     gr.Info(i18n("已处理网络素材，并设为参考音色"), duration=2)
     clip_note = f"已截取 {format_clip_time(start_seconds)} - {format_clip_time(end_seconds)}。"
@@ -2094,6 +2194,7 @@ with gr.Blocks(
     with gr.Tab(i18n("工作台")):
         with gr.Row(elem_classes=["studio-shell"]):
             os.makedirs("prompts",exist_ok=True)
+            network_source_config = load_network_source_config()
             with gr.Column(scale=4, elem_classes=["studio-panel", "voice-panel"]):
                 gr.HTML('<div class="panel-heading"><span>01</span><strong>音色来源</strong></div>')
                 with gr.Tabs(elem_classes=["voice-source-tabs"]):
@@ -2129,6 +2230,24 @@ with gr.Blocks(
                                 label=i18n("截取终点"),
                                 placeholder="默认起点后 60 秒",
                             )
+                        with gr.Accordion(i18n("下载设置"), open=False):
+                            with gr.Row():
+                                network_use_proxy = gr.Checkbox(
+                                    label=i18n("启用下载代理"),
+                                    value=network_source_config["use_proxy"],
+                                )
+                                network_proxy = gr.Textbox(
+                                    label=i18n("代理地址"),
+                                    value=network_source_config["proxy"],
+                                    placeholder="http://127.0.0.1:7897",
+                                    interactive=network_source_config["use_proxy"],
+                                )
+                            network_cookies_file = gr.Textbox(
+                                label=i18n("Cookie 文件路径"),
+                                value=network_source_config["cookies_file"],
+                                placeholder="可选，例如 ~/Downloads/cookies.txt",
+                            )
+                            network_config_status = gr.Markdown("网络素材配置会在解析时自动保存。")
                         process_network_media_button = gr.Button(
                             i18n("解析并用作音色"),
                             elem_id="process_network_media_button",
@@ -2207,8 +2326,9 @@ with gr.Blocks(
                         with gr.Row():
                             smart_api_key = gr.Textbox(
                                 label=i18n("API Key"),
-                                value=smart_llm_config["api_key"],
+                                value="",
                                 type="password",
+                                placeholder=i18n("已保存则可留空；输入新 Key 会更新本机配置"),
                             )
                             smart_use_proxy = gr.Checkbox(
                                 label=i18n("启用代理"),
@@ -2222,7 +2342,7 @@ with gr.Blocks(
                             )
                         with gr.Row():
                             smart_save_config_button = gr.Button(i18n("保存大模型配置"))
-                            smart_config_status = gr.Markdown("已载入大模型配置。")
+                            smart_config_status = gr.Markdown("已载入大模型配置。API Key 已保存在本机，页面不会回填显示。")
                 with gr.Row():
                     with gr.Column(scale=1):
                         segments_preview = gr.Dataframe(
@@ -2562,12 +2682,31 @@ with gr.Blocks(
         show_progress="hidden",
     ).then(
         process_network_voice_media,
-        inputs=[network_voice_url, network_clip_start, network_clip_end],
+        inputs=[network_voice_url, network_clip_start, network_clip_end, network_use_proxy, network_proxy, network_cookies_file],
         outputs=[prompt_audio, network_voice_status],
         show_progress="full",
     ).then(
         restore_processing_button,
         outputs=[process_network_media_button],
+        show_progress="hidden",
+    )
+
+    network_use_proxy.change(
+        on_network_proxy_toggle,
+        inputs=[network_use_proxy, network_proxy, network_cookies_file],
+        outputs=[network_proxy, network_config_status],
+        show_progress="hidden",
+    )
+    network_proxy.change(
+        save_network_source_config,
+        inputs=[network_use_proxy, network_proxy, network_cookies_file],
+        outputs=[network_config_status],
+        show_progress="hidden",
+    )
+    network_cookies_file.change(
+        save_network_source_config,
+        inputs=[network_use_proxy, network_proxy, network_cookies_file],
+        outputs=[network_config_status],
         show_progress="hidden",
     )
 
@@ -2640,12 +2779,12 @@ with gr.Blocks(
     )
 
     smart_analysis_mode.change(
-        save_smart_llm_config,
+        save_smart_llm_config_keep_key,
         inputs=[smart_analysis_mode, smart_api_base, smart_api_key, smart_model, smart_use_proxy, smart_proxy, smart_pause_ms],
         outputs=[smart_config_status],
     )
     smart_api_base.change(
-        save_smart_llm_config,
+        save_smart_llm_config_keep_key,
         inputs=[smart_analysis_mode, smart_api_base, smart_api_key, smart_model, smart_use_proxy, smart_proxy, smart_pause_ms],
         outputs=[smart_config_status],
     )
@@ -2655,17 +2794,17 @@ with gr.Blocks(
         outputs=[smart_config_status],
     )
     smart_model.change(
-        save_smart_llm_config,
+        save_smart_llm_config_keep_key,
         inputs=[smart_analysis_mode, smart_api_base, smart_api_key, smart_model, smart_use_proxy, smart_proxy, smart_pause_ms],
         outputs=[smart_config_status],
     )
     smart_pause_ms.change(
-        save_smart_llm_config,
+        save_smart_llm_config_keep_key,
         inputs=[smart_analysis_mode, smart_api_base, smart_api_key, smart_model, smart_use_proxy, smart_proxy, smart_pause_ms],
         outputs=[smart_config_status],
     )
     smart_proxy.change(
-        save_smart_llm_config,
+        save_smart_llm_config_keep_key,
         inputs=[smart_analysis_mode, smart_api_base, smart_api_key, smart_model, smart_use_proxy, smart_proxy, smart_pause_ms],
         outputs=[smart_config_status],
     )
@@ -2675,7 +2814,7 @@ with gr.Blocks(
         outputs=[smart_proxy, smart_config_status],
     )
     smart_save_config_button.click(
-        save_smart_llm_config,
+        save_smart_llm_config_keep_key,
         inputs=[smart_analysis_mode, smart_api_base, smart_api_key, smart_model, smart_use_proxy, smart_proxy, smart_pause_ms],
         outputs=[smart_config_status],
     )
