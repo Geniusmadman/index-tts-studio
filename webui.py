@@ -90,6 +90,23 @@ FFMPEG_CANDIDATES = [
     "/usr/local/bin/ffmpeg",
     "/usr/bin/ffmpeg",
 ]
+EXTRA_EXEC_PATHS = [
+    "/opt/homebrew/bin",
+    "/usr/local/bin",
+    "/usr/bin",
+]
+
+def ensure_exec_paths():
+    paths = [path for path in os.environ.get("PATH", "").split(os.pathsep) if path]
+    changed = False
+    for path in EXTRA_EXEC_PATHS:
+        if os.path.isdir(path) and path not in paths:
+            paths.insert(0, path)
+            changed = True
+    if changed:
+        os.environ["PATH"] = os.pathsep.join(paths)
+
+ensure_exec_paths()
 
 def resolve_ffmpeg_path():
     for candidate in FFMPEG_CANDIDATES:
@@ -898,6 +915,7 @@ def process_network_voice_media(url, start_time, end_time, progress=gr.Progress(
     try:
         progress(0.08, desc="正在加载 yt-dlp...")
         import yt_dlp
+        from yt_dlp.postprocessor.ffmpeg import FFmpegPostProcessor
         from yt_dlp.utils import download_range_func
     except ImportError:
         gr.Error(i18n("未安装 yt-dlp，请重新同步项目依赖"))
@@ -913,6 +931,9 @@ def process_network_voice_media(url, start_time, end_time, progress=gr.Progress(
         if not ffmpeg_path:
             gr.Error(i18n("未找到 ffmpeg，请先安装 ffmpeg"))
             return gr.update(), voice_status_html("error", "未找到 ffmpeg", "请先安装 ffmpeg 后再处理网络素材。")
+        ffmpeg_dir = os.path.dirname(ffmpeg_path)
+        if ffmpeg_dir and ffmpeg_dir not in os.environ.get("PATH", "").split(os.pathsep):
+            os.environ["PATH"] = ffmpeg_dir + os.pathsep + os.environ.get("PATH", "")
         ydl_opts = {
             "format": "bestaudio/best",
             "outtmpl": os.path.join(tmp_dir, "%(title).80s.%(ext)s"),
@@ -924,7 +945,7 @@ def process_network_voice_media(url, start_time, end_time, progress=gr.Progress(
             "socket_timeout": 30,
             "download_ranges": download_range_func(None, [(start_seconds, end_seconds)]),
             "force_keyframes_at_cuts": True,
-            "ffmpeg_location": os.path.dirname(ffmpeg_path),
+            "ffmpeg_location": ffmpeg_path,
             "http_headers": {
                 "User-Agent": (
                     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
@@ -943,8 +964,12 @@ def process_network_voice_media(url, start_time, end_time, progress=gr.Progress(
             ydl_opts["cookiefile"] = cookie_path
         try:
             progress(0.2, desc="正在解析素材链接...")
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                ydl.extract_info(url, download=True)
+            ffmpeg_location_token = FFmpegPostProcessor._ffmpeg_location.set(ffmpeg_path)
+            try:
+                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                    ydl.extract_info(url, download=True)
+            finally:
+                FFmpegPostProcessor._ffmpeg_location.reset(ffmpeg_location_token)
             progress(0.72, desc="正在定位下载片段...")
             media_path = find_downloaded_media_file(tmp_dir)
             if not media_path:
